@@ -21,8 +21,7 @@ pub enum LogLevel {
     #[default]
     Normal,
     /// Minimal output: only warnings and errors (warn + error).
-    /// Startup messages (config, DC connectivity, proxy links) are always shown
-    /// via info! before the filter is applied.
+    /// Proxy links may still be emitted through their dedicated target.
     Silent,
 }
 
@@ -1688,6 +1687,14 @@ impl Default for TlsFetchConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ExclusiveMaskTarget {
+    /// Target host after IDNA/IP normalization.
+    pub host: String,
+    /// TCP port for the selected target.
+    pub port: u16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AntiCensorshipConfig {
     #[serde(default = "default_tls_domain")]
@@ -1718,6 +1725,14 @@ pub struct AntiCensorshipConfig {
 
     #[serde(default = "default_mask_port")]
     pub mask_port: u16,
+
+    /// Per-SNI TCP mask targets. Keys are SNI domains, values are `host:port`.
+    #[serde(default)]
+    pub exclusive_mask: HashMap<String, String>,
+
+    /// Parsed runtime cache for per-SNI TCP mask targets.
+    #[serde(skip)]
+    pub exclusive_mask_targets: HashMap<String, ExclusiveMaskTarget>,
 
     #[serde(default)]
     pub mask_unix_sock: Option<String>,
@@ -1842,6 +1857,8 @@ impl Default for AntiCensorshipConfig {
             mask: default_true(),
             mask_host: None,
             mask_port: default_mask_port(),
+            exclusive_mask: HashMap::new(),
+            exclusive_mask_targets: HashMap::new(),
             mask_unix_sock: None,
             fake_cert_len: default_fake_cert_len(),
             tls_emulation: true,

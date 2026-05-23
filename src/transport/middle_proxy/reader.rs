@@ -19,7 +19,7 @@ use crate::error::{ProxyError, Result};
 use crate::protocol::constants::*;
 use crate::stats::Stats;
 
-use super::codec::{RpcChecksumMode, WriterCommand, rpc_crc};
+use super::codec::{RpcChecksumMode, WriterCommand, build_control_payload, rpc_crc};
 use super::fairness::{
     AdmissionDecision, DispatchAction, DispatchFeedback, PressureState, SchedulerDecision,
     WorkerFairnessConfig, WorkerFairnessSnapshot, WorkerFairnessState,
@@ -464,10 +464,8 @@ pub(crate) async fn reader_loop(
             } else if pt == RPC_PING_U32 && body.len() >= 8 {
                 let ping_id = i64::from_le_bytes(body[0..8].try_into().unwrap());
                 trace!(ping_id, "RPC_PING -> RPC_PONG");
-                let mut pong = Vec::with_capacity(12);
-                pong.extend_from_slice(&RPC_PONG_U32.to_le_bytes());
-                pong.extend_from_slice(&ping_id.to_le_bytes());
-                match tx.try_send(WriterCommand::DataAndFlush(Bytes::from(pong))) {
+                let pong = build_control_payload(RPC_PONG_U32, ping_id as u64);
+                match tx.try_send(WriterCommand::ControlAndFlush(pong)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
                         debug!(ping_id, "PONG dropped: writer command channel is full");
@@ -667,10 +665,8 @@ mod tests {
 }
 
 async fn send_close_conn(tx: &mpsc::Sender<WriterCommand>, conn_id: u64) {
-    let mut p = Vec::with_capacity(12);
-    p.extend_from_slice(&RPC_CLOSE_CONN_U32.to_le_bytes());
-    p.extend_from_slice(&conn_id.to_le_bytes());
-    match tx.try_send(WriterCommand::DataAndFlush(Bytes::from(p))) {
+    let payload = build_control_payload(RPC_CLOSE_CONN_U32, conn_id);
+    match tx.try_send(WriterCommand::ControlAndFlush(payload)) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             debug!(

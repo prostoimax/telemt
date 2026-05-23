@@ -257,45 +257,7 @@ pub(crate) async fn spawn_runtime_tasks(
     });
 
     if let Some(pool) = me_pool {
-        let reinit_trigger_capacity = config.general.me_reinit_trigger_channel.max(1);
-        let (reinit_tx, reinit_rx) = mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
-
-        let pool_clone_sched = pool.clone();
-        let rng_clone_sched = rng.clone();
-        let config_rx_clone_sched = config_rx.clone();
-        let me_ready_tx_sched = me_ready_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_reinit_scheduler(
-                pool_clone_sched,
-                rng_clone_sched,
-                config_rx_clone_sched,
-                reinit_rx,
-                me_ready_tx_sched,
-            )
-            .await;
-        });
-
-        let pool_clone = pool.clone();
-        let config_rx_clone = config_rx.clone();
-        let reinit_tx_updater = reinit_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_config_updater(
-                pool_clone,
-                config_rx_clone,
-                reinit_tx_updater,
-            )
-            .await;
-        });
-
-        let config_rx_clone_rot = config_rx.clone();
-        let reinit_tx_rotation = reinit_tx.clone();
-        tokio::spawn(async move {
-            crate::transport::middle_proxy::me_rotation_task(
-                config_rx_clone_rot,
-                reinit_tx_rotation,
-            )
-            .await;
-        });
+        spawn_middle_proxy_runtime_tasks(config, config_rx.clone(), pool, rng, me_ready_tx);
     }
 
     RuntimeWatches {
@@ -306,19 +268,58 @@ pub(crate) async fn spawn_runtime_tasks(
     }
 }
 
+pub(crate) fn spawn_middle_proxy_runtime_tasks(
+    config: &ProxyConfig,
+    config_rx: watch::Receiver<Arc<ProxyConfig>>,
+    pool: Arc<MePool>,
+    rng: Arc<SecureRandom>,
+    me_ready_tx: watch::Sender<u64>,
+) {
+    let reinit_trigger_capacity = config.general.me_reinit_trigger_channel.max(1);
+    let (reinit_tx, reinit_rx) = mpsc::channel::<MeReinitTrigger>(reinit_trigger_capacity);
+
+    let pool_clone_sched = pool.clone();
+    let rng_clone_sched = rng.clone();
+    let config_rx_clone_sched = config_rx.clone();
+    let me_ready_tx_sched = me_ready_tx.clone();
+    tokio::spawn(async move {
+        crate::transport::middle_proxy::me_reinit_scheduler(
+            pool_clone_sched,
+            rng_clone_sched,
+            config_rx_clone_sched,
+            reinit_rx,
+            me_ready_tx_sched,
+        )
+        .await;
+    });
+
+    let pool_clone = pool.clone();
+    let config_rx_clone = config_rx.clone();
+    let reinit_tx_updater = reinit_tx.clone();
+    tokio::spawn(async move {
+        crate::transport::middle_proxy::me_config_updater(
+            pool_clone,
+            config_rx_clone,
+            reinit_tx_updater,
+        )
+        .await;
+    });
+
+    let config_rx_clone_rot = config_rx.clone();
+    let reinit_tx_rotation = reinit_tx.clone();
+    tokio::spawn(async move {
+        crate::transport::middle_proxy::me_rotation_task(config_rx_clone_rot, reinit_tx_rotation)
+            .await;
+    });
+}
+
 pub(crate) async fn apply_runtime_log_filter(
     has_rust_log: bool,
     effective_log_level: &LogLevel,
     filter_handle: reload::Handle<EnvFilter, tracing_subscriber::Registry>,
     mut log_level_rx: watch::Receiver<LogLevel>,
 ) {
-    let runtime_filter = if has_rust_log {
-        EnvFilter::from_default_env()
-    } else if matches!(effective_log_level, LogLevel::Silent) {
-        EnvFilter::new("warn,telemt::links=info")
-    } else {
-        EnvFilter::new(effective_log_level.to_filter_str())
-    };
+    let runtime_filter = EnvFilter::new(log_filter_spec(has_rust_log, effective_log_level));
     filter_handle
         .reload(runtime_filter)
         .expect("Failed to switch log filter");
@@ -329,12 +330,23 @@ pub(crate) async fn apply_runtime_log_filter(
                 break;
             }
             let level = log_level_rx.borrow_and_update().clone();
-            let new_filter = tracing_subscriber::EnvFilter::new(level.to_filter_str());
+            let new_filter = tracing_subscriber::EnvFilter::new(log_filter_spec(false, &level));
             if let Err(e) = filter_handle.reload(new_filter) {
                 tracing::error!("config reload: failed to update log filter: {}", e);
             }
         }
     });
+}
+
+pub(crate) fn log_filter_spec(has_rust_log: bool, effective_log_level: &LogLevel) -> String {
+    if has_rust_log {
+        std::env::var("RUST_LOG")
+            .unwrap_or_else(|_| effective_log_level.to_filter_str().to_string())
+    } else if matches!(effective_log_level, LogLevel::Silent) {
+        "warn,telemt::links=info".to_string()
+    } else {
+        effective_log_level.to_filter_str().to_string()
+    }
 }
 
 pub(crate) async fn spawn_metrics_if_configured(

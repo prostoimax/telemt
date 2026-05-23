@@ -205,6 +205,8 @@ Notes:
 | `max_tcp_conns` | `usize` | no | Per-user concurrent TCP limit. |
 | `expiration_rfc3339` | `string` | no | RFC3339 expiration timestamp. |
 | `data_quota_bytes` | `u64` | no | Per-user traffic quota. |
+| `rate_limit_up_bps` | `u64` | no | Per-user upload rate limit in bytes per second. |
+| `rate_limit_down_bps` | `u64` | no | Per-user download rate limit in bytes per second. |
 | `max_unique_ips` | `usize` | no | Per-user unique source IP limit. |
 
 ### `PatchUserRequest`
@@ -215,6 +217,8 @@ Notes:
 | `max_tcp_conns` | `usize|null` | no | Per-user concurrent TCP limit; `null` removes the per-user override. |
 | `expiration_rfc3339` | `string|null` | no | RFC3339 expiration timestamp; `null` removes the expiration. |
 | `data_quota_bytes` | `u64|null` | no | Per-user traffic quota; `null` removes the per-user quota. |
+| `rate_limit_up_bps` | `u64|null` | no | Per-user upload rate limit in bytes per second; `null` removes the upload direction limit. |
+| `rate_limit_down_bps` | `u64|null` | no | Per-user download rate limit in bytes per second; `null` removes the download direction limit. |
 | `max_unique_ips` | `usize|null` | no | Per-user unique source IP limit; `null` removes the per-user override. |
 
 ### `access.user_source_deny` via API
@@ -303,7 +307,7 @@ An empty request body is accepted and generates a new secret automatically.
 | `route_mode` | `string` | Current route mode label from route runtime controller. |
 | `reroute_active` | `bool` | `true` when ME fallback currently routes new sessions to Direct-DC. |
 | `reroute_to_direct_at_epoch_secs` | `u64?` | Unix timestamp when current direct reroute began. |
-| `reroute_reason` | `string?` | `fast_not_ready_fallback` or `strict_grace_fallback` while reroute is active. |
+| `reroute_reason` | `string?` | `startup_direct_fallback`, `fast_not_ready_fallback`, or `strict_grace_fallback` while reroute is active. |
 | `startup_status` | `string` | Startup status (`pending`, `initializing`, `ready`, `failed`, `skipped`). |
 | `startup_stage` | `string` | Current startup stage identifier. |
 | `startup_progress_pct` | `f64` | Startup progress percentage (`0..100`). |
@@ -1166,6 +1170,8 @@ An empty request body is accepted and generates a new secret automatically.
 | `max_tcp_conns` | `usize?` | Optional max concurrent TCP limit. |
 | `expiration_rfc3339` | `string?` | Optional expiration timestamp. |
 | `data_quota_bytes` | `u64?` | Optional data quota. |
+| `rate_limit_up_bps` | `u64?` | Optional upload rate limit in bytes per second. |
+| `rate_limit_down_bps` | `u64?` | Optional download rate limit in bytes per second. |
 | `max_unique_ips` | `usize?` | Optional unique IP limit. |
 | `current_connections` | `u64` | Current live connections. |
 | `active_unique_ips` | `usize` | Current active unique source IPs. |
@@ -1242,6 +1248,12 @@ All mutating endpoints:
 - Return new `revision` after successful write.
 - Use process-local mutation lock + atomic write (`tmp + rename`) for config persistence.
 
+Docker deployment note:
+- Mutating endpoints require `config.toml` to live inside a writable mounted directory.
+- Do not mount `config.toml` as a single bind-mounted file when API mutations are enabled; atomic `tmp + rename` writes can fail with `Device or resource busy`.
+- Mount the config directory instead, for example `./config:/etc/telemt:rw`, and start Telemt with `/etc/telemt/config.toml`.
+- A read-only single-file mount remains valid only for read-only deployments or when `[server.api].read_only=true`.
+
 Delete path cleanup guarantees:
 - Config cleanup removes only the requested username keys.
 - Runtime unique-IP cleanup removes only this user's limiter and tracked IP state.
@@ -1274,12 +1286,12 @@ Additional runtime endpoint behavior:
 ## ME Fallback Behavior Exposed Via API
 
 When `general.use_middle_proxy=true` and `general.me2dc_fallback=true`:
-- Startup does not block on full ME pool readiness; initialization can continue in background.
+- Startup opens Direct-DC routing first, then initializes ME in background and switches new sessions to Middle mode after ME readiness is observed.
 - Runtime initialization payload can expose ME stage `background_init` until pool becomes ready.
 - Admission/routing decision uses two readiness grace windows for "ME not ready" periods:
-  `80s` before first-ever readiness is observed (startup grace),
+  direct startup fallback before first-ever readiness is observed,
   `6s` after readiness has been observed at least once (runtime failover timeout).
-- While in fallback window breach, new sessions are routed via Direct-DC; when ME becomes ready, routing returns to Middle mode for new sessions.
+- While fallback is active, new sessions are routed via Direct-DC; when ME becomes ready, routing returns to Middle mode. Direct sessions affected by the cutover are closed with the existing staggered delay so clients reconnect through the current route.
 
 ## Serialization Rules
 

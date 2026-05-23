@@ -473,6 +473,8 @@ pub(super) struct UserInfo {
     pub(super) max_tcp_conns: Option<usize>,
     pub(super) expiration_rfc3339: Option<String>,
     pub(super) data_quota_bytes: Option<u64>,
+    pub(super) rate_limit_up_bps: Option<u64>,
+    pub(super) rate_limit_down_bps: Option<u64>,
     pub(super) max_unique_ips: Option<usize>,
     pub(super) current_connections: u64,
     pub(super) active_unique_ips: usize,
@@ -508,6 +510,19 @@ pub(super) struct ResetUserQuotaResponse {
     pub(super) last_reset_epoch_secs: u64,
 }
 
+#[derive(Serialize)]
+pub(super) struct UserQuotaListData {
+    pub(super) users: Vec<UserQuotaEntry>,
+}
+
+#[derive(Serialize)]
+pub(super) struct UserQuotaEntry {
+    pub(super) username: String,
+    pub(super) data_quota_bytes: u64,
+    pub(super) used_bytes: u64,
+    pub(super) last_reset_epoch_secs: u64,
+}
+
 #[derive(Deserialize)]
 pub(super) struct CreateUserRequest {
     pub(super) username: String,
@@ -516,6 +531,8 @@ pub(super) struct CreateUserRequest {
     pub(super) max_tcp_conns: Option<usize>,
     pub(super) expiration_rfc3339: Option<String>,
     pub(super) data_quota_bytes: Option<u64>,
+    pub(super) rate_limit_up_bps: Option<u64>,
+    pub(super) rate_limit_down_bps: Option<u64>,
     pub(super) max_unique_ips: Option<usize>,
 }
 
@@ -530,6 +547,10 @@ pub(super) struct PatchUserRequest {
     pub(super) expiration_rfc3339: Patch<String>,
     #[serde(default, deserialize_with = "patch_field")]
     pub(super) data_quota_bytes: Patch<u64>,
+    #[serde(default, deserialize_with = "patch_field")]
+    pub(super) rate_limit_up_bps: Patch<u64>,
+    #[serde(default, deserialize_with = "patch_field")]
+    pub(super) rate_limit_down_bps: Patch<u64>,
     #[serde(default, deserialize_with = "patch_field")]
     pub(super) max_unique_ips: Patch<usize>,
 }

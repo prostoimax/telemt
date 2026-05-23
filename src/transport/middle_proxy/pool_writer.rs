@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use bytes::BytesMut;
 use rand::RngExt;
 use tokio::sync::mpsc;
@@ -17,7 +16,7 @@ use crate::crypto::SecureRandom;
 use crate::error::{ProxyError, Result};
 use crate::protocol::constants::{RPC_CLOSE_EXT_U32, RPC_PING_U32};
 
-use super::codec::{RpcWriter, WriterCommand};
+use super::codec::{RpcWriter, WriterCommand, build_control_payload};
 use super::pool::{MePool, MeWriter, WriterContour};
 use super::reader::reader_loop;
 use super::wire::build_proxy_req_payload;
@@ -59,6 +58,12 @@ async fn writer_command_loop(
                         rpc_writer.send(&payload).await?;
                     }
                     Some(WriterCommand::DataAndFlush(payload)) => {
+                        rpc_writer.send_and_flush(&payload).await?;
+                    }
+                    Some(WriterCommand::ProxyReq(command)) => {
+                        rpc_writer.send_proxy_req(&command).await?;
+                    }
+                    Some(WriterCommand::ControlAndFlush(payload)) => {
                         rpc_writer.send_and_flush(&payload).await?;
                     }
                     Some(WriterCommand::Close) | None => return Ok(()),
@@ -130,9 +135,7 @@ async fn ping_loop(
             _ = tokio::time::sleep(wait) => {}
         }
         let sent_id = ping_id;
-        let mut p = Vec::with_capacity(12);
-        p.extend_from_slice(&RPC_PING_U32.to_le_bytes());
-        p.extend_from_slice(&sent_id.to_le_bytes());
+        let payload = build_control_payload(RPC_PING_U32, sent_id as u64);
         {
             let mut tracker = ping_tracker_ping.lock().await;
             cleanup_tick = cleanup_tick.wrapping_add(1);
@@ -149,7 +152,7 @@ async fn ping_loop(
         ping_id = ping_id.wrapping_add(1);
         stats_ping.increment_me_keepalive_sent();
         if tx_ping
-            .send(WriterCommand::DataAndFlush(Bytes::from(p)))
+            .send(WriterCommand::ControlAndFlush(payload))
             .await
             .is_err()
         {
@@ -253,12 +256,10 @@ async fn rpc_proxy_req_signal_loop(
             stats_signal.increment_me_rpc_proxy_req_signal_response_total();
         }
 
-        let mut close_payload = Vec::with_capacity(12);
-        close_payload.extend_from_slice(&RPC_CLOSE_EXT_U32.to_le_bytes());
-        close_payload.extend_from_slice(&conn_id.to_le_bytes());
+        let close_payload = build_control_payload(RPC_CLOSE_EXT_U32, conn_id);
 
         if tx_signal
-            .send(WriterCommand::DataAndFlush(Bytes::from(close_payload)))
+            .send(WriterCommand::ControlAndFlush(close_payload))
             .await
             .is_err()
         {
@@ -380,6 +381,7 @@ impl MePool {
             iv: hs.write_iv,
             seq_no: 0,
             crc_mode: hs.crc_mode,
+            frame_buf: Vec::new(),
         };
         let writer = MeWriter {
             id: writer_id,

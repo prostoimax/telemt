@@ -3,6 +3,7 @@ use std::net::IpAddr;
 use hyper::StatusCode;
 
 use crate::config::ProxyConfig;
+use crate::config::RateLimitBps;
 use crate::ip_tracker::UserIpTracker;
 use crate::stats::Stats;
 
@@ -13,8 +14,9 @@ use super::config_store::{
 };
 use super::model::{
     ApiFailure, CreateUserRequest, CreateUserResponse, PatchUserRequest, RotateSecretRequest,
-    TlsDomainLink, UserInfo, UserLinks, is_valid_ad_tag, is_valid_user_secret, is_valid_username,
-    parse_optional_expiration, parse_patch_expiration, random_user_secret,
+    TlsDomainLink, UserInfo, UserLinks, UserQuotaEntry, UserQuotaListData, is_valid_ad_tag,
+    is_valid_user_secret, is_valid_username, parse_optional_expiration, parse_patch_expiration,
+    random_user_secret,
 };
 use super::patch::Patch;
 
@@ -27,6 +29,8 @@ pub(super) async fn create_user(
     let touches_user_max_tcp_conns = body.max_tcp_conns.is_some();
     let touches_user_expirations = body.expiration_rfc3339.is_some();
     let touches_user_data_quota = body.data_quota_bytes.is_some();
+    let touches_user_rate_limits =
+        body.rate_limit_up_bps.is_some() || body.rate_limit_down_bps.is_some();
     let touches_user_max_unique_ips = body.max_unique_ips.is_some();
 
     if !is_valid_username(&body.username) {
@@ -91,6 +95,15 @@ pub(super) async fn create_user(
             .user_data_quota
             .insert(body.username.clone(), quota);
     }
+    if touches_user_rate_limits {
+        cfg.access.user_rate_limits.insert(
+            body.username.clone(),
+            RateLimitBps {
+                up_bps: body.rate_limit_up_bps.unwrap_or(0),
+                down_bps: body.rate_limit_down_bps.unwrap_or(0),
+            },
+        );
+    }
 
     let updated_limit = body.max_unique_ips;
     if let Some(limit) = updated_limit {
@@ -114,6 +127,9 @@ pub(super) async fn create_user(
     }
     if touches_user_data_quota {
         touched_sections.push(AccessSection::UserDataQuota);
+    }
+    if touches_user_rate_limits {
+        touched_sections.push(AccessSection::UserRateLimits);
     }
     if touches_user_max_unique_ips {
         touched_sections.push(AccessSection::UserMaxUniqueIps);
@@ -157,6 +173,8 @@ pub(super) async fn create_user(
                     .then_some(cfg.access.user_max_tcp_conns_global_each)),
             expiration_rfc3339: None,
             data_quota_bytes: None,
+            rate_limit_up_bps: body.rate_limit_up_bps.filter(|limit| *limit > 0),
+            rate_limit_down_bps: body.rate_limit_down_bps.filter(|limit| *limit > 0),
             max_unique_ips: updated_limit,
             current_connections: 0,
             active_unique_ips: 0,
@@ -181,6 +199,8 @@ pub(super) async fn patch_user(
     let touches_user_max_tcp_conns = !matches!(&body.max_tcp_conns, Patch::Unchanged);
     let touches_user_expirations = !matches!(&body.expiration_rfc3339, Patch::Unchanged);
     let touches_user_data_quota = !matches!(&body.data_quota_bytes, Patch::Unchanged);
+    let touches_user_rate_limits = !matches!(&body.rate_limit_up_bps, Patch::Unchanged)
+        || !matches!(&body.rate_limit_down_bps, Patch::Unchanged);
     let touches_user_max_unique_ips = !matches!(&body.max_unique_ips, Patch::Unchanged);
 
     if let Some(secret) = body.secret.as_ref()
@@ -253,6 +273,31 @@ pub(super) async fn patch_user(
             cfg.access.user_data_quota.insert(user.to_string(), quota);
         }
     }
+    if touches_user_rate_limits {
+        let mut rate_limit = cfg
+            .access
+            .user_rate_limits
+            .get(user)
+            .copied()
+            .unwrap_or_default();
+        match body.rate_limit_up_bps {
+            Patch::Unchanged => {}
+            Patch::Remove => rate_limit.up_bps = 0,
+            Patch::Set(limit) => rate_limit.up_bps = limit,
+        }
+        match body.rate_limit_down_bps {
+            Patch::Unchanged => {}
+            Patch::Remove => rate_limit.down_bps = 0,
+            Patch::Set(limit) => rate_limit.down_bps = limit,
+        }
+        if rate_limit.up_bps == 0 && rate_limit.down_bps == 0 {
+            cfg.access.user_rate_limits.remove(user);
+        } else {
+            cfg.access
+                .user_rate_limits
+                .insert(user.to_string(), rate_limit);
+        }
+    }
     // Capture how the per-user IP limit changed, so the in-memory ip_tracker
     // can be synced (set or removed) after the config is persisted.
     let max_unique_ips_change = match body.max_unique_ips {
@@ -287,6 +332,9 @@ pub(super) async fn patch_user(
     }
     if touches_user_data_quota {
         touched_sections.push(AccessSection::UserDataQuota);
+    }
+    if touches_user_rate_limits {
+        touched_sections.push(AccessSection::UserRateLimits);
     }
     if touches_user_max_unique_ips {
         touched_sections.push(AccessSection::UserMaxUniqueIps);
@@ -355,6 +403,7 @@ pub(super) async fn rotate_secret(
         AccessSection::UserMaxTcpConns,
         AccessSection::UserExpirations,
         AccessSection::UserDataQuota,
+        AccessSection::UserRateLimits,
         AccessSection::UserMaxUniqueIps,
     ];
     let revision =
@@ -414,6 +463,7 @@ pub(super) async fn delete_user(
     cfg.access.user_max_tcp_conns.remove(user);
     cfg.access.user_expirations.remove(user);
     cfg.access.user_data_quota.remove(user);
+    cfg.access.user_rate_limits.remove(user);
     cfg.access.user_max_unique_ips.remove(user);
 
     cfg.validate()
@@ -424,6 +474,7 @@ pub(super) async fn delete_user(
         AccessSection::UserMaxTcpConns,
         AccessSection::UserExpirations,
         AccessSection::UserDataQuota,
+        AccessSection::UserRateLimits,
         AccessSection::UserMaxUniqueIps,
     ];
     let revision =
@@ -485,6 +536,18 @@ pub(super) async fn users_from_config(
                 .get(&username)
                 .map(chrono::DateTime::<chrono::Utc>::to_rfc3339),
             data_quota_bytes: cfg.access.user_data_quota.get(&username).copied(),
+            rate_limit_up_bps: cfg
+                .access
+                .user_rate_limits
+                .get(&username)
+                .map(|limit| limit.up_bps)
+                .filter(|limit| *limit > 0),
+            rate_limit_down_bps: cfg
+                .access
+                .user_rate_limits
+                .get(&username)
+                .map(|limit| limit.down_bps)
+                .filter(|limit| *limit > 0),
             max_unique_ips: cfg
                 .access
                 .user_max_unique_ips
@@ -504,6 +567,33 @@ pub(super) async fn users_from_config(
         });
     }
     users
+}
+
+pub(super) fn build_user_quota_list(cfg: &ProxyConfig, stats: &Stats) -> UserQuotaListData {
+    let mut names = cfg.access.users.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+
+    let snapshot = stats.user_quota_snapshot();
+    let mut users = Vec::with_capacity(names.len());
+    for username in names {
+        let Some(&data_quota_bytes) = cfg.access.user_data_quota.get(&username) else {
+            continue;
+        };
+        if data_quota_bytes == 0 {
+            continue;
+        }
+        let (used_bytes, last_reset_epoch_secs) = snapshot
+            .get(&username)
+            .map(|entry| (entry.used_bytes, entry.last_reset_epoch_secs))
+            .unwrap_or((0, 0));
+        users.push(UserQuotaEntry {
+            username,
+            data_quota_bytes,
+            used_bytes,
+            last_reset_epoch_secs,
+        });
+    }
+    UserQuotaListData { users }
 }
 
 fn empty_user_links() -> UserLinks {
@@ -759,6 +849,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn users_from_config_reports_user_rate_limits() {
+        let mut cfg = ProxyConfig::default();
+        cfg.access.users.insert(
+            "alice".to_string(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+        );
+        cfg.access.user_rate_limits.insert(
+            "alice".to_string(),
+            RateLimitBps {
+                up_bps: 1024,
+                down_bps: 0,
+            },
+        );
+
+        let stats = Stats::new();
+        let tracker = UserIpTracker::new();
+
+        let users = users_from_config(&cfg, &stats, &tracker, None, None, None).await;
+        let alice = users
+            .iter()
+            .find(|entry| entry.username == "alice")
+            .expect("alice must be present");
+
+        assert_eq!(alice.rate_limit_up_bps, Some(1024));
+        assert_eq!(alice.rate_limit_down_bps, None);
+    }
+
+    #[tokio::test]
     async fn users_from_config_marks_runtime_membership_when_snapshot_is_provided() {
         let mut disk_cfg = ProxyConfig::default();
         disk_cfg.access.users.insert(
@@ -868,5 +986,69 @@ mod tests {
                 .iter()
                 .any(|entry| entry.domain == "front-a.example.com")
         );
+    }
+
+    #[test]
+    fn build_user_quota_list_skips_users_without_positive_quota_and_sorts_by_username() {
+        let mut cfg = ProxyConfig::default();
+        cfg.access.users.insert(
+            "alice".to_string(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+        );
+        cfg.access.users.insert(
+            "bob".to_string(),
+            "fedcba9876543210fedcba9876543210".to_string(),
+        );
+        cfg.access.users.insert(
+            "carol".to_string(),
+            "aaaabbbbccccddddeeeeffff00001111".to_string(),
+        );
+        // alice has a positive quota and should be listed.
+        cfg.access
+            .user_data_quota
+            .insert("alice".to_string(), 1 << 20);
+        // bob has no quota entry at all (None) — should be skipped.
+        // carol has an explicit zero quota — should be skipped.
+        cfg.access.user_data_quota.insert("carol".to_string(), 0);
+
+        let stats = Stats::new();
+        // Charge some traffic against alice; carol gets traffic too but should
+        // still be filtered out by the quota check.
+        let alice_stats = stats.get_or_create_user_stats_handle("alice");
+        stats.quota_charge_post_write(&alice_stats, 4096);
+        let carol_stats = stats.get_or_create_user_stats_handle("carol");
+        stats.quota_charge_post_write(&carol_stats, 99);
+
+        let data = build_user_quota_list(&cfg, &stats);
+
+        assert_eq!(data.users.len(), 1);
+        let entry = &data.users[0];
+        assert_eq!(entry.username, "alice");
+        assert_eq!(entry.data_quota_bytes, 1 << 20);
+        assert_eq!(entry.used_bytes, 4096);
+        assert_eq!(entry.last_reset_epoch_secs, 0);
+    }
+
+    #[test]
+    fn build_user_quota_list_orders_multiple_users_by_username_ascending() {
+        let mut cfg = ProxyConfig::default();
+        for name in ["charlie", "alice", "bob"] {
+            cfg.access.users.insert(
+                name.to_string(),
+                "0123456789abcdef0123456789abcdef".to_string(),
+            );
+            cfg.access.user_data_quota.insert(name.to_string(), 1 << 30);
+        }
+
+        let stats = Stats::new();
+        let data = build_user_quota_list(&cfg, &stats);
+
+        let names: Vec<&str> = data.users.iter().map(|e| e.username.as_str()).collect();
+        assert_eq!(names, vec!["alice", "bob", "charlie"]);
+        for entry in &data.users {
+            assert_eq!(entry.used_bytes, 0);
+            assert_eq!(entry.last_reset_epoch_secs, 0);
+            assert_eq!(entry.data_quota_bytes, 1 << 30);
+        }
     }
 }

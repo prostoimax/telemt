@@ -31,6 +31,87 @@ fn is_valid_tls_domain_name(domain: &str) -> bool {
             .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '\\'))
 }
 
+fn normalize_domain_to_ascii(domain: &str, field: &str) -> Result<String> {
+    let domain = domain.trim();
+    if !is_valid_tls_domain_name(domain) {
+        return Err(ProxyError::Config(format!(
+            "Invalid {field}: '{}'. Must be a valid domain name",
+            domain
+        )));
+    }
+
+    let parsed = url::Url::parse(&format!("https://{domain}/")).map_err(|error| {
+        ProxyError::Config(format!(
+            "Invalid {field}: '{}'. IDNA conversion failed: {error}",
+            domain
+        ))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        ProxyError::Config(format!("Invalid {field}: '{}'. Host is empty", domain))
+    })?;
+    Ok(host.to_ascii_lowercase())
+}
+
+fn normalize_mask_host_to_ascii(host: &str, field: &str) -> Result<String> {
+    let host = host.trim();
+    if host.starts_with('[') && host.ends_with(']') {
+        let inner = &host[1..host.len() - 1];
+        let ip = inner.parse::<std::net::IpAddr>().map_err(|_| {
+            ProxyError::Config(format!(
+                "Invalid {field}: '{}'. IPv6 literal is invalid",
+                host
+            ))
+        })?;
+        return match ip {
+            std::net::IpAddr::V6(v6) => Ok(format!("[{v6}]")),
+            std::net::IpAddr::V4(v4) => Ok(v4.to_string()),
+        };
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => Ok(v4.to_string()),
+            std::net::IpAddr::V6(v6) => Ok(format!("[{v6}]")),
+        };
+    }
+
+    normalize_domain_to_ascii(host, field)
+}
+
+fn parse_exclusive_mask_target(target: &str) -> Option<(&str, u16)> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    if target.starts_with('[') {
+        let end = target.find(']')?;
+        if target.get(end + 1..end + 2)? != ":" {
+            return None;
+        }
+        let host = &target[..=end];
+        let port = target[end + 2..].parse::<u16>().ok()?;
+        return (port > 0).then_some((host, port));
+    }
+
+    let (host, port) = target.rsplit_once(':')?;
+    if host.is_empty() || host.contains(':') {
+        return None;
+    }
+    let port = port.parse::<u16>().ok()?;
+    (port > 0).then_some((host, port))
+}
+
+fn normalize_exclusive_mask_target(target: &str, field: &str) -> Result<String> {
+    let (host, port) = parse_exclusive_mask_target(target).ok_or_else(|| {
+        ProxyError::Config(format!(
+            "Invalid {field}: '{}'. Expected host:port with port > 0",
+            target
+        ))
+    })?;
+    let host = normalize_mask_host_to_ascii(host, field)?;
+    Ok(format!("{host}:{port}"))
+}
+
 const TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "general",
     "network",
@@ -291,6 +372,7 @@ const CENSORSHIP_CONFIG_KEYS: &[&str] = &[
     "mask",
     "mask_host",
     "mask_port",
+    "exclusive_mask",
     "mask_unix_sock",
     "fake_cert_len",
     "tls_emulation",
@@ -1887,10 +1969,8 @@ impl ProxyConfig {
             }
         }
 
-        // Validate tls_domain.
-        if config.censorship.tls_domain.is_empty() {
-            return Err(ProxyError::Config("tls_domain cannot be empty".to_string()));
-        }
+        config.censorship.tls_domain =
+            normalize_domain_to_ascii(&config.censorship.tls_domain, "censorship.tls_domain")?;
 
         // Validate mask_unix_sock.
         if let Some(ref sock_path) = config.censorship.mask_unix_sock {
@@ -1918,9 +1998,28 @@ impl ProxyConfig {
             }
         }
 
+        if let Some(mask_host) = config.censorship.mask_host.as_mut() {
+            *mask_host = normalize_mask_host_to_ascii(mask_host, "censorship.mask_host")?;
+        }
+
         // Default mask_host to tls_domain if not set and no unix socket configured.
         if config.censorship.mask_host.is_none() && config.censorship.mask_unix_sock.is_none() {
             config.censorship.mask_host = Some(config.censorship.tls_domain.clone());
+        }
+
+        for (domain, target) in &config.censorship.exclusive_mask {
+            if !is_valid_tls_domain_name(domain) {
+                return Err(ProxyError::Config(format!(
+                    "Invalid censorship.exclusive_mask domain: '{}'. Must be a valid domain name",
+                    domain
+                )));
+            }
+            if parse_exclusive_mask_target(target).is_none() {
+                return Err(ProxyError::Config(format!(
+                    "Invalid censorship.exclusive_mask target for '{}': '{}'. Expected host:port with port > 0",
+                    domain, target
+                )));
+            }
         }
 
         // Normalize optional TLS fetch scope: whitespace-only values disable scoped routing.
@@ -1953,8 +2052,11 @@ impl ProxyConfig {
             let mut all = Vec::with_capacity(1 + config.censorship.tls_domains.len());
             all.push(config.censorship.tls_domain.clone());
             for d in std::mem::take(&mut config.censorship.tls_domains) {
-                if !d.is_empty() && !all.contains(&d) {
-                    all.push(d);
+                if !d.is_empty() {
+                    let domain = normalize_domain_to_ascii(&d, "censorship.tls_domains entry")?;
+                    if !all.contains(&domain) {
+                        all.push(domain);
+                    }
                 }
             }
             // keep primary as tls_domain; store remaining back to tls_domains
@@ -1962,6 +2064,31 @@ impl ProxyConfig {
                 config.censorship.tls_domains = all[1..].to_vec();
             }
         }
+
+        let mut exclusive_mask = HashMap::with_capacity(config.censorship.exclusive_mask.len());
+        let mut exclusive_mask_targets =
+            HashMap::with_capacity(config.censorship.exclusive_mask.len());
+        for (domain, target) in std::mem::take(&mut config.censorship.exclusive_mask) {
+            let domain = normalize_domain_to_ascii(&domain, "censorship.exclusive_mask domain")?;
+            let target =
+                normalize_exclusive_mask_target(&target, "censorship.exclusive_mask target")?;
+            let Some((host, port)) = parse_exclusive_mask_target(&target) else {
+                return Err(ProxyError::Config(format!(
+                    "Invalid censorship.exclusive_mask target for '{}': '{}'. Expected host:port with port > 0",
+                    domain, target
+                )));
+            };
+            exclusive_mask_targets.insert(
+                domain.clone(),
+                ExclusiveMaskTarget {
+                    host: host.to_string(),
+                    port,
+                },
+            );
+            exclusive_mask.insert(domain, target);
+        }
+        config.censorship.exclusive_mask = exclusive_mask;
+        config.censorship.exclusive_mask_targets = exclusive_mask_targets;
 
         // Migration: prefer_ipv6 -> network.prefer.
         if config.general.prefer_ipv6 {
@@ -2122,6 +2249,21 @@ impl ProxyConfig {
                 return Err(ProxyError::Config(format!(
                     "Invalid tls_domains entry: '{}'. Must be a valid domain name",
                     domain
+                )));
+            }
+        }
+
+        for (domain, target) in &self.censorship.exclusive_mask {
+            if !is_valid_tls_domain_name(domain) {
+                return Err(ProxyError::Config(format!(
+                    "Invalid censorship.exclusive_mask domain: '{}'. Must be a valid domain name",
+                    domain
+                )));
+            }
+            if parse_exclusive_mask_target(target).is_none() {
+                return Err(ProxyError::Config(format!(
+                    "Invalid censorship.exclusive_mask target for '{}': '{}'. Expected host:port with port > 0",
+                    domain, target
                 )));
             }
         }
@@ -2664,6 +2806,44 @@ mod tests {
         assert_eq!(
             cfg_reject.censorship.unknown_sni_action,
             UnknownSniAction::RejectHandshake
+        );
+    }
+
+    #[test]
+    fn exclusive_mask_parses_domain_target_map() {
+        let cfg = load_config_from_temp_toml(
+            r#"
+            [general]
+            [network]
+            [server]
+            [access]
+            [censorship]
+            tls_domain = "weißbiergärten.de"
+            tls_domains = ["bürgeramt.de"]
+            [censorship.exclusive_mask]
+            "bürgeramt.de" = "rindfleischetikettierungsüberwachungsaufgabenübertragungsgesetz.de:443"
+            "ipv6.example" = "[::1]:443"
+            "#,
+        );
+
+        assert!(cfg.censorship.tls_domain.is_ascii());
+        assert!(cfg.censorship.tls_domain.contains("xn--"));
+        assert_eq!(cfg.censorship.tls_domains.len(), 1);
+        let normalized_extra = &cfg.censorship.tls_domains[0];
+        assert!(normalized_extra.is_ascii());
+        assert!(normalized_extra.contains("xn--"));
+
+        let normalized_target = cfg
+            .censorship
+            .exclusive_mask
+            .get(normalized_extra)
+            .expect("exclusive_mask key must match normalized tls_domains entry");
+        assert!(normalized_target.is_ascii());
+        assert!(normalized_target.contains("xn--"));
+        assert!(normalized_target.ends_with(":443"));
+        assert_eq!(
+            cfg.censorship.exclusive_mask.get("ipv6.example"),
+            Some(&"[::1]:443".to_string())
         );
     }
 
