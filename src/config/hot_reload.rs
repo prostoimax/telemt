@@ -16,10 +16,12 @@
 //! | `general` | `telemetry` / `me_*_policy`    | Applied immediately                            |
 //! | `network` | `dns_overrides`                | Applied immediately                            |
 //! | `access`  | All user/quota fields          | Effective immediately                          |
+//! | `server.listeners` | `synlimit*` for existing endpoints | Netfilter rules reconciled immediately |
 //!
 //! Fields that require re-binding sockets (`server.listeners`, legacy
 //! `server.port`, `censorship.*`, `network.*`, `use_middle_proxy`) are **not**
-//! applied; a warning is emitted.
+//! applied, except for SYN limiter fields on unchanged listener endpoints; a
+//! warning is emitted.
 //! Non-hot changes are never mixed into the runtime config snapshot.
 
 use std::collections::BTreeSet;
@@ -34,7 +36,8 @@ use tracing::{error, info, warn};
 
 use super::load::{LoadedConfig, ProxyConfig};
 use crate::config::{
-    LogLevel, MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel, MeWriterPickMode,
+    ListenerConfig, LogLevel, MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel,
+    MeWriterPickMode, SynLimitMode,
 };
 
 const HOT_RELOAD_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -131,6 +134,17 @@ pub struct HotFields {
     pub user_max_unique_ips_global_each: usize,
     pub user_max_unique_ips_mode: crate::config::UserMaxUniqueIpsMode,
     pub user_max_unique_ips_window_secs: u64,
+    pub listener_synlimit: Vec<ListenerSynLimitHotFields>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerSynLimitHotFields {
+    pub ip: IpAddr,
+    pub port: Option<u16>,
+    pub synlimit: SynLimitMode,
+    pub synlimit_seconds: u32,
+    pub synlimit_hitcount: u32,
+    pub synlimit_burst: u32,
 }
 
 impl HotFields {
@@ -260,6 +274,25 @@ impl HotFields {
             user_max_unique_ips_global_each: cfg.access.user_max_unique_ips_global_each,
             user_max_unique_ips_mode: cfg.access.user_max_unique_ips_mode,
             user_max_unique_ips_window_secs: cfg.access.user_max_unique_ips_window_secs,
+            listener_synlimit: cfg
+                .server
+                .listeners
+                .iter()
+                .map(ListenerSynLimitHotFields::from_listener)
+                .collect(),
+        }
+    }
+}
+
+impl ListenerSynLimitHotFields {
+    fn from_listener(listener: &ListenerConfig) -> Self {
+        Self {
+            ip: listener.ip,
+            port: listener.port,
+            synlimit: listener.synlimit,
+            synlimit_seconds: listener.synlimit_seconds,
+            synlimit_hitcount: listener.synlimit_hitcount,
+            synlimit_burst: listener.synlimit_burst,
         }
     }
 }
@@ -566,12 +599,28 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     cfg.access.user_max_unique_ips_global_each = new.access.user_max_unique_ips_global_each;
     cfg.access.user_max_unique_ips_mode = new.access.user_max_unique_ips_mode;
     cfg.access.user_max_unique_ips_window_secs = new.access.user_max_unique_ips_window_secs;
+    overlay_listener_synlimit_fields(&mut cfg.server.listeners, &new.server.listeners);
 
     if cfg.rebuild_runtime_user_auth().is_err() {
         cfg.runtime_user_auth = None;
     }
 
     cfg
+}
+
+fn overlay_listener_synlimit_fields(old: &mut [ListenerConfig], new: &[ListenerConfig]) {
+    if old.len() != new.len() {
+        return;
+    }
+    for (old_listener, new_listener) in old.iter_mut().zip(new.iter()) {
+        if old_listener.ip != new_listener.ip || old_listener.port != new_listener.port {
+            continue;
+        }
+        old_listener.synlimit = new_listener.synlimit;
+        old_listener.synlimit_seconds = new_listener.synlimit_seconds;
+        old_listener.synlimit_hitcount = new_listener.synlimit_hitcount;
+        old_listener.synlimit_burst = new_listener.synlimit_burst;
+    }
 }
 
 /// Warn if any non-hot fields changed (require restart).
@@ -847,6 +896,13 @@ fn log_changes(
         info!(
             "config reload: network.dns_overrides updated ({} entries)",
             new_hot.dns_overrides.len()
+        );
+    }
+
+    if old_hot.listener_synlimit != new_hot.listener_synlimit {
+        info!(
+            "config reload: server.listeners SYN limiter updated ({} listeners)",
+            new_hot.listener_synlimit.len()
         );
     }
 

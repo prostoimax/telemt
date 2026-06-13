@@ -155,57 +155,35 @@ fn push_fallback_size(sizes: &mut Vec<usize>, size: usize) {
 }
 
 fn fallback_family_app_data_sizes(cached: &CachedTlsData) -> Vec<usize> {
-    if matches!(cached.behavior_profile.source, TlsProfileSource::Rustls)
-        && !cached.app_data_records_sizes.is_empty()
-    {
-        return cached.app_data_records_sizes.clone();
-    }
-
-    let family = fallback_shape_family(cached);
-    let mut remaining = fallback_total_app_data_len(cached);
-    let preferred_chunk = match family {
-        FallbackShapeFamily::NginxLike => 2896,
-        FallbackShapeFamily::BoringSslLike => 1369,
-        FallbackShapeFamily::RustlsLike => 2048,
+    let mut sizes = Vec::with_capacity(1);
+    let size = if matches!(cached.behavior_profile.source, TlsProfileSource::Rustls) {
+        cached
+            .app_data_records_sizes
+            .first()
+            .copied()
+            .unwrap_or_else(|| fallback_total_app_data_len(cached))
+    } else {
+        fallback_total_app_data_len(cached)
     };
-    let split_threshold = match family {
-        FallbackShapeFamily::NginxLike => 4096,
-        FallbackShapeFamily::BoringSslLike => 1536,
-        FallbackShapeFamily::RustlsLike => 3072,
-    };
-
-    if remaining <= split_threshold {
-        return vec![remaining.clamp(MIN_APP_DATA, MAX_APP_DATA)];
-    }
-
-    let mut sizes: Vec<usize> = Vec::new();
-    while remaining > 0 {
-        let chunk = remaining.min(preferred_chunk).min(MAX_APP_DATA);
-        if chunk < MIN_APP_DATA {
-            if let Some(last) = sizes.last_mut() {
-                *last = (*last).saturating_add(chunk).min(MAX_APP_DATA);
-            } else {
-                push_fallback_size(&mut sizes, chunk);
-            }
-            break;
-        }
-        push_fallback_size(&mut sizes, chunk);
-        remaining = remaining.saturating_sub(chunk);
-    }
-
+    push_fallback_size(&mut sizes, size);
     sizes
 }
 
 fn emulated_app_data_sizes(cached: &CachedTlsData) -> Vec<usize> {
     match cached.behavior_profile.source {
         TlsProfileSource::Raw | TlsProfileSource::Merged => {
-            if !cached.behavior_profile.app_data_record_sizes.is_empty() {
-                return cached.behavior_profile.app_data_record_sizes.clone();
+            if let Some(size) = cached.behavior_profile.app_data_record_sizes.first() {
+                return vec![(*size).clamp(MIN_APP_DATA, MAX_APP_DATA)];
             }
-            if !cached.app_data_records_sizes.is_empty() {
-                return cached.app_data_records_sizes.clone();
+            if let Some(size) = cached.app_data_records_sizes.first() {
+                return vec![(*size).clamp(MIN_APP_DATA, MAX_APP_DATA)];
             }
-            return vec![cached.total_app_data_len.max(1024)];
+            return vec![
+                cached
+                    .total_app_data_len
+                    .max(1024)
+                    .clamp(MIN_APP_DATA, MAX_APP_DATA),
+            ];
         }
         TlsProfileSource::Default | TlsProfileSource::Rustls => {
             return fallback_family_app_data_sizes(cached);
@@ -417,7 +395,7 @@ pub fn build_emulated_server_hello(
     alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
 ) -> Vec<u8> {
-    // --- ServerHello ---
+    // ServerHello carries the authenticated digest bytes that the client verifies.
     let extensions = build_profiled_server_hello_extensions(cached, server_key_share);
     let extensions_len = extensions.len() as u16;
 
@@ -449,7 +427,7 @@ pub fn build_emulated_server_hello(
     server_hello.extend_from_slice(&(message.len() as u16).to_be_bytes());
     server_hello.extend_from_slice(&message);
 
-    // --- ChangeCipherSpec ---
+    // ChangeCipherSpec is part of the client-visible TLS shim prefix.
     let change_cipher_spec_count = emulated_change_cipher_spec_count(cached);
     let mut change_cipher_spec = Vec::with_capacity(change_cipher_spec_count * 6);
     for _ in 0..change_cipher_spec_count {
@@ -463,7 +441,8 @@ pub fn build_emulated_server_hello(
         ]);
     }
 
-    // --- ApplicationData (fake encrypted records) ---
+    // Telegram clients authenticate the hello prefix and then expose any later
+    // ApplicationData bytes to the MTProto packet parser.
     let mut sizes = {
         let base_sizes = emulated_app_data_sizes(cached);
         match cached.behavior_profile.source {
@@ -550,8 +529,7 @@ pub fn build_emulated_server_hello(
         app_data.extend_from_slice(&rec);
     }
 
-    // --- Combine ---
-    // Optional NewSessionTicket mimic records (opaque ApplicationData for fingerprint).
+    // Optional NewSessionTicket mimic records are an explicit fingerprint opt-in.
     let mut tickets = Vec::new();
     for ticket_len in emulated_ticket_record_sizes(cached, new_session_tickets, rng) {
         let mut rec = Vec::with_capacity(5 + ticket_len);
@@ -570,7 +548,7 @@ pub fn build_emulated_server_hello(
     response.extend_from_slice(&app_data);
     response.extend_from_slice(&tickets);
 
-    // --- HMAC ---
+    // The digest authenticates the server response bytes emitted by this builder.
     let mut hmac_input = Vec::with_capacity(TLS_DIGEST_LEN + response.len());
     hmac_input.extend_from_slice(client_digest);
     hmac_input.extend_from_slice(&response);
@@ -1062,7 +1040,7 @@ mod tests {
             app_lens.push(record_len);
             pos += 5 + record_len;
         }
-        assert_eq!(app_lens, vec![64, 3905, 537]);
+        assert_eq!(app_lens, vec![64]);
         assert_eq!(pos, response.len());
     }
 }

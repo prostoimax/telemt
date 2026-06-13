@@ -106,7 +106,37 @@ fn emulated_server_hello_does_not_emit_profile_ticket_tail_when_disabled() {
     );
 
     let app_records = record_lengths_by_type(&response, TLS_RECORD_APPLICATION);
-    assert_eq!(app_records, vec![1200, 900]);
+    assert_eq!(app_records, vec![1200]);
+}
+
+#[test]
+fn emulated_server_hello_keeps_default_profile_primary_app_data_single() {
+    let mut cached = make_cached();
+    cached.behavior_profile.source = TlsProfileSource::Default;
+    cached.behavior_profile.app_data_record_sizes.clear();
+    cached.behavior_profile.ticket_record_sizes.clear();
+    cached.app_data_records_sizes = vec![2048, 1024];
+    cached.total_app_data_len = 5000;
+    let rng = SecureRandom::new();
+
+    let response = build_emulated_server_hello(
+        b"secret",
+        &[0x85; 32],
+        &[0x86; 16],
+        &cached,
+        false,
+        true,
+        ClientHelloTlsVersion::Tls13,
+        [0x13, 0x01],
+        &test_server_key_share(),
+        &rng,
+        None,
+        0,
+    );
+
+    let app_records = record_lengths_by_type(&response, TLS_RECORD_APPLICATION);
+    assert_eq!(app_records.len(), 1);
+    assert!(app_records[0] >= 64);
 }
 
 #[test]
@@ -130,5 +160,5 @@ fn emulated_server_hello_uses_profile_ticket_lengths_when_enabled() {
     );
 
     let app_records = record_lengths_by_type(&response, TLS_RECORD_APPLICATION);
-    assert_eq!(app_records, vec![1200, 900, 220, 180]);
+    assert_eq!(app_records, vec![1200, 220, 180]);
 }
